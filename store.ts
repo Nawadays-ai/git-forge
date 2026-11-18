@@ -13,6 +13,13 @@ export type GitObjectType = 'commit' | 'tree' | 'blob' | 'tag';
 export interface GitObject {
   readonly type: GitObjectType;
   readonly data: Buffer;
+  /**
+   * Lazily filled by writePack in git.ts: the zlib stream of `data` at level 1.
+   * An object is immutable once stored (its data is never reassigned or mutated
+   * in place anywhere in the forge), so the cached stream stays valid for the
+   * object's whole life and repeated packs of the same object reuse it verbatim.
+   */
+  deflated?: Buffer;
 }
 
 export interface Label {

@@ -275,7 +275,12 @@ export function writePack(objects: readonly GitObject[]): Buffer {
   const parts: Buffer[] = [header];
   for (const object of objects) {
     parts.push(writePackObjectHeader(object.type, object.data.length));
-    parts.push(deflateSync(object.data));
+    // Reuse the object's cached zlib stream when present: under concurrent
+    // clones the same objects are packed again and again, and re-deflating
+    // them per request is pure repeated CPU. The stream is a pure function of
+    // the immutable object data, so the pack bytes (and the trailer checksum
+    // computed over them below) are exactly what a fresh deflate would write.
+    parts.push((object.deflated ??= deflateSync(object.data, { level: 1 })));
   }
   const body = Buffer.concat(parts);
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
