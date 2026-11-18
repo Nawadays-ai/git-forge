@@ -663,9 +663,14 @@ export function handleReceivePack(repo: Repo, body: Buffer): GitResponse {
     } catch (err) {
       unpackError = err instanceof Error ? err.message : String(err);
     }
-  } else if (commands.some((command) => command.newOid !== ZERO_OID)) {
+  } else if (packStart < body.length && commands.some((command) => command.newOid !== ZERO_OID)) {
+    // Trailing bytes that do not start a packfile: the push body is malformed.
     unpackError = 'no packfile received';
   }
+  // No trailing bytes at all is a legal ref-only push: a new branch or tag pointing
+  // at a commit the server already has (some clients omit the packfile entirely in
+  // that case), or pure ref deletions. There is nothing to unpack, and
+  // applyPushCommand verifies each new oid exists in the store before applying it.
 
   const results: Array<{ ref: string; ok: boolean; reason: string }> = [];
   for (const command of commands) {
