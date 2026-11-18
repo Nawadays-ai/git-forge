@@ -221,7 +221,13 @@ interface FieldNode {
 
 type SelectionNode =
   | FieldNode
-  | { kind: 'inlineFragment'; typeCondition: string; selection: SelectionNode[] };
+  | { kind: 'inlineFragment'; typeCondition: string; selection: SelectionNode[] }
+  | { kind: 'fragmentSpread'; name: string };
+
+interface FragmentDefinition {
+  typeCondition: string;
+  selection: SelectionNode[];
+}
 
 interface Operation {
   type: 'query' | 'mutation';
@@ -232,6 +238,8 @@ interface Operation {
 class Parser {
   private pos = 0;
   private readonly tokens: Token[];
+  /** Named fragment definitions collected while parsing, keyed by fragment name. */
+  readonly fragments = new Map<string, FragmentDefinition>();
 
   constructor(tokens: Token[]) {
     this.tokens = tokens;
@@ -283,7 +291,27 @@ class Parser {
         operations.push({ type: token.value, name, selection: this.parseSelectionSet() });
         continue;
       }
-      // Fragments and anything else: skip a balanced block if present.
+      if (token.kind === 'name' && token.value === 'fragment') {
+        this.next();
+        const nameToken = this.next();
+        this.next(); // 'on'
+        const typeToken = this.next();
+        // Directives on a fragment definition are skipped, as on fields.
+        while (this.peek()?.kind === 'punct' && this.peek()?.value === '@') {
+          this.next();
+          this.next();
+          if (this.peek()?.kind === 'punct' && this.peek()?.value === '(') this.skipBalancedParens();
+        }
+        const selection = this.parseSelectionSet();
+        if (nameToken.kind === 'name') {
+          this.fragments.set(nameToken.value, {
+            typeCondition: typeToken.kind === 'name' ? typeToken.value : '',
+            selection,
+          });
+        }
+        continue;
+      }
+      // Anything else: skip a balanced block if present.
       this.next();
       if (this.peek()?.kind === 'name') this.next();
       if (this.peek()?.kind === 'name') this.next();
@@ -317,9 +345,8 @@ class Parser {
         if (onToken.kind === 'name' && onToken.value === 'on') {
           const typeToken = this.next();
           selections.push({ kind: 'inlineFragment', typeCondition: typeToken.kind === 'name' ? typeToken.value : '', selection: this.parseSelectionSet() });
-        } else {
-          // Fragment spread: not used by the suite; skip it.
-          continue;
+        } else if (onToken.kind === 'name') {
+          selections.push({ kind: 'fragmentSpread', name: onToken.value });
         }
         continue;
       }
@@ -445,6 +472,9 @@ type GqlValue =
 interface Ctx {
   variables: Record<string, unknown>;
   errors: Array<{ message: string }>;
+  fragments: ReadonlyMap<string, FragmentDefinition>;
+  /** Depth of nested fragment-spread expansion, as a cycle guard. */
+  spreadDepth: number;
 }
 
 function tagged(type: string, data: Record<string, unknown>): GqlValue {
@@ -517,6 +547,17 @@ function issueConnection(repo: Repo, args: Map<string, unknown>): GqlValue {
   return connection('IssueConnection', issues.map((issue) => issueValue(repo, issue)), args);
 }
 
+/** The node a global id names (repository, issue or pull request), or null. */
+function lookupNodeByGlobalId(id: string): GqlValue {
+  const found = repoByGlobalId(id);
+  if (found) return repoValue(found);
+  const issueFound = issueByGlobalId(id);
+  if (issueFound) return issueValue(issueFound.repo, issueFound.issue);
+  const pullFound = pullByGlobalId(id);
+  if (pullFound) return pullValue(pullFound.repo, pullFound.pull);
+  return null;
+}
+
 function resolveField(typeName: string, source: GqlValue, field: string, args: Map<string, unknown>, ctx: Ctx): GqlValue | undefined {
   const record = typeof source === 'object' && source !== null && !Array.isArray(source) ? (source as Record<string, unknown>) : {};
 
@@ -531,14 +572,20 @@ function resolveField(typeName: string, source: GqlValue, field: string, args: M
         return repo ? repoValue(repo) : null;
       }
       case 'node': {
-        const id = String(args.get('id') ?? '');
-        const found = repoByGlobalId(id);
-        if (found) return repoValue(found);
-        const issueFound = issueByGlobalId(id);
-        if (issueFound) return issueValue(issueFound.repo, issueFound.issue);
-        const pullFound = pullByGlobalId(id);
-        if (pullFound) return pullValue(pullFound.repo, pullFound.pull);
-        return null;
+        return lookupNodeByGlobalId(String(args.get('id') ?? ''));
+      }
+      case 'nodes': {
+        const ids = args.get('ids');
+        const list = Array.isArray(ids) ? ids : [];
+        return list.map((id) => lookupNodeByGlobalId(String(id ?? '')));
+      }
+      case 'rateLimit': {
+        return tagged('RateLimit', {
+          limit: 5000,
+          cost: 1,
+          remaining: 4999,
+          resetAt: new Date(Date.now() + 3_600_000).toISOString(),
+        });
       }
       case '__type': {
         const name = String(args.get('name') ?? '');
@@ -870,6 +917,23 @@ function completeValue(value: GqlValue, selection: SelectionNode[] | null, ctx: 
       }
       continue;
     }
+    if (node.kind === 'fragmentSpread') {
+      const fragment = ctx.fragments.get(node.name);
+      if (!fragment) {
+        ctx.errors.push({ message: `Fragment '${node.name}' is not defined` });
+        continue;
+      }
+      if (fragment.typeCondition !== typeName && fragment.typeCondition !== '') continue;
+      if (ctx.spreadDepth >= 32) {
+        ctx.errors.push({ message: `Fragment '${node.name}': spread cycle or excessive nesting` });
+        continue;
+      }
+      ctx.spreadDepth += 1;
+      const inner = completeValue(value, fragment.selection, ctx) as Record<string, unknown>;
+      ctx.spreadDepth -= 1;
+      Object.assign(out, inner);
+      continue;
+    }
     const key = node.alias ?? node.name;
     if (node.name === '__typename') {
       out[key] = typeName;
@@ -888,8 +952,8 @@ function completeValue(value: GqlValue, selection: SelectionNode[] | null, ctx: 
   return out;
 }
 
-function executeOperation(operation: Operation, variables: Record<string, unknown>): { data: unknown; errors?: Array<{ message: string }> } {
-  const ctx: Ctx = { variables, errors: [] };
+function executeOperation(operation: Operation, variables: Record<string, unknown>, fragments: ReadonlyMap<string, FragmentDefinition>): { data: unknown; errors?: Array<{ message: string }> } {
+  const ctx: Ctx = { variables, errors: [], fragments, spreadDepth: 0 };
   const rootType = operation.type === 'mutation' ? 'Mutation' : 'Query';
   const root = tagged(rootType === 'Mutation' ? 'Mutation' : 'Query', {});
   const data = completeValue(root, operation.selection, ctx);
@@ -911,8 +975,11 @@ function executeRequest(request: GqlRequest): { data: unknown; errors?: Array<{ 
   const query = typeof request.query === 'string' ? request.query : '';
   if (query === '') return { data: null, errors: [{ message: 'A query string is required' }] };
   let operations: Operation[];
+  let fragments: ReadonlyMap<string, FragmentDefinition>;
   try {
-    operations = new Parser(lex(query)).parseDocument();
+    const parser = new Parser(lex(query));
+    operations = parser.parseDocument();
+    fragments = parser.fragments;
   } catch (err) {
     return { data: null, errors: [{ message: err instanceof Error ? err.message : 'Parse error' }] };
   }
@@ -922,7 +989,7 @@ function executeRequest(request: GqlRequest): { data: unknown; errors?: Array<{ 
     operation = operations.find((candidate) => candidate.name === request.operationName) ?? operation;
   }
   const variables = typeof request.variables === 'object' && request.variables !== null ? (request.variables as Record<string, unknown>) : {};
-  return executeOperation(operation, variables);
+  return executeOperation(operation, variables, fragments);
 }
 
 export async function handleGraphQL(req: IncomingMessage, res: ServerResponse, body: Buffer): Promise<void> {
