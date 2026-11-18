@@ -769,20 +769,56 @@ export function createPull(repo: Repo, title: string, bodyText: string, head: st
   return pull;
 }
 
-/** Line counts of a text diff (LCS over lines; the suite's files are small). */
+/** Above this many cells, the LCS length is computed with a two-row table instead. */
+const DIFF_TABLE_LIMIT = 4_194_304;
+
+/** Length of the longest common subsequence of two line arrays. */
+function lcsLength(a: string[], b: string[]): number {
+  const m = a.length;
+  const n = b.length;
+  if (m === 0 || n === 0) return 0;
+  if ((m + 1) * (n + 1) <= DIFF_TABLE_LIMIT) {
+    const dp: number[] = new Array((m + 1) * (n + 1)).fill(0);
+    for (let i = m - 1; i >= 0; i -= 1) {
+      for (let j = n - 1; j >= 0; j -= 1) {
+        dp[i * (n + 1) + j] = a[i] === b[j] ? (dp[(i + 1) * (n + 1) + j + 1] as number) + 1 : Math.max(dp[(i + 1) * (n + 1) + j] as number, dp[i * (n + 1) + j + 1] as number);
+      }
+    }
+    return dp[0] as number;
+  }
+  // The same recurrence evaluated with two rows: identical result, O(n) memory
+  // instead of a quadratic table of numbers (a 10k-by-10k table is ~800 MB).
+  let below = new Uint32Array(n + 1);
+  let row = new Uint32Array(n + 1);
+  for (let i = m - 1; i >= 0; i -= 1) {
+    for (let j = n - 1; j >= 0; j -= 1) {
+      row[j] = a[i] === b[j] ? (below[j + 1] as number) + 1 : Math.max(below[j] as number, row[j + 1] as number);
+    }
+    [below, row] = [row, below];
+  }
+  return below[0] as number;
+}
+
+/** Line counts of a text diff (LCS over lines). */
 function lineDiff(oldText: string, newText: string): { additions: number; deletions: number } {
   const oldLines = oldText === '' ? [] : oldText.split('\n');
   const newLines = newText === '' ? [] : newText.split('\n');
-  const m = oldLines.length;
-  const n = newLines.length;
-  const dp: number[] = new Array((m + 1) * (n + 1)).fill(0);
-  for (let i = m - 1; i >= 0; i -= 1) {
-    for (let j = n - 1; j >= 0; j -= 1) {
-      dp[i * (n + 1) + j] = oldLines[i] === newLines[j] ? (dp[(i + 1) * (n + 1) + j + 1] as number) + 1 : Math.max(dp[(i + 1) * (n + 1) + j] as number, dp[i * (n + 1) + j + 1] as number);
-    }
+  // Identical leading and trailing lines belong to every longest common
+  // subsequence, so trimming them before the quadratic step never changes the
+  // counts — and a small edit inside a large file stops costing a full
+  // (m+1)*(n+1) table.
+  let start = 0;
+  const minLength = Math.min(oldLines.length, newLines.length);
+  while (start < minLength && oldLines[start] === newLines[start]) start += 1;
+  let oldEnd = oldLines.length;
+  let newEnd = newLines.length;
+  while (oldEnd > start && newEnd > start && oldLines[oldEnd - 1] === newLines[newEnd - 1]) {
+    oldEnd -= 1;
+    newEnd -= 1;
   }
-  const common = dp[0] as number;
-  return { additions: n - common, deletions: m - common };
+  const trimmed = start + (oldLines.length - oldEnd);
+  const common = trimmed + lcsLength(oldLines.slice(start, oldEnd), newLines.slice(start, newEnd));
+  return { additions: newLines.length - common, deletions: oldLines.length - common };
 }
 
 export function pullFiles(repo: Repo, pull: Pull): Json[] {
