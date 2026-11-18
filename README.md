@@ -6,14 +6,16 @@ no UI:
 
 - **Git smart HTTP** — upload-pack protocol v2 (`ls-refs`, `fetch`) and v0,
   receive-pack v0 with per-ref status reports: clone, fetch (incremental,
-  shallow, deepen, unshallow), push (fast-forward only), annotated tags.
+  shallow, deepen, unshallow), push (fast-forward only, including ref-only
+  pushes that carry no packfile), annotated tags.
 - **REST v3** at `/api/v3` — repositories (CRUD, pagination), git refs,
   branches, commits, contents (read/write/delete), labels, issues and comments,
   pull requests with changed-files diffs and three-way squash/merge.
 - **GraphQL v4** at `/api/graphql` — viewer and repository reads, issue and
   pull-request connections with cursor pagination, introspection (`__type`),
-  Relay `node(id:)` with opaque global ids, batched operations, and the
-  create/close/merge/comment mutations.
+  Relay `node(id:)` and `nodes(ids:)` with opaque global ids, `rateLimit`,
+  named fragments, batched operations, and the create/close/merge/comment
+  mutations.
 - **MCP** at `/mcp` — streamable-HTTP JSON-RPC speaking the modern
   `server/discover` era (with the legacy `initialize` handshake kept), and six
   tools: `create_repo`, `get_repo`, `create_issue`, `list_issues`,
@@ -68,9 +70,12 @@ Locally: `npm start` with `MAKEFUN_ENV_URL` and `MAKEFUN_SHOP_TOKEN` set.
 
 Against the practice kit's conformance runner (the same checks the closed
 suite runs): **120/120 checks pass** — git 30/30, repos 15/15, issues 15/15,
-pulls 20/20, protocol 5/5, graphql 20/20, mcp 15/15. Timed workloads on the
-development VM scored 186/200 perf points (push 45, clone 44, read 49,
-write 48 against the kit's calibrated references). The git surface was also
-verified end-to-end with a real `git` client (clone, shallow clone, deepen,
-unshallow, push, non-fast-forward refusal) — the client is used for testing
-only; the program itself never invokes it.
+pulls 20/20, protocol 5/5, graphql 20/20, mcp 15/15 — re-verified after an
+external-audit fix round (ref-only pushes, GraphQL `nodes`/`rateLimit`/named
+fragments, pack deflate caching, bounded diff memory). Timed workloads on
+the development VM scored 189/200 perf points in the same re-verification
+(push 46, clone 47, read 50, write 46 against the kit's calibrated
+references; earlier runs measured 183–193, the VM is shared). The git
+surface was also verified end-to-end with a real `git` client (clone,
+shallow clone, deepen, unshallow, push, non-fast-forward refusal) — the
+client is used for testing only; the program itself never invokes it.
