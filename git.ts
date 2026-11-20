@@ -601,6 +601,47 @@ function parseFetchArgs(lines: readonly string[]): FetchArgs {
 }
 
 // ---------------------------------------------------------------------------------------------
+// fetch answers, reused
+
+/**
+ * A fetch answer is a pure function of the repository's objects and refs and of
+ * the request body: the plan reads nothing else, pack building is deterministic,
+ * and objects are immutable and content-addressed. The store only ever grows —
+ * objects are added, never removed or changed — so the pair (refs fingerprint,
+ * object count) identifies the store exactly: the count can never revisit a value
+ * holding different contents, and the fingerprint pins every ref. A burst of
+ * identical fetches (concurrent clones of one tip) therefore reuses the first
+ * answer's bytes instead of replanning and repacking per request. Only a handful
+ * of answers are kept per repository, oldest first out.
+ */
+const fetchAnswerCache = new WeakMap<Repo, Map<string, GitResponse>>();
+const FETCH_ANSWER_CACHE_MAX = 4;
+
+function repoStateFingerprint(repo: Repo): string {
+  const refs = [...repo.refs.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  let out = `${repo.objects.size}`;
+  for (const [name, oid] of refs) out += `\n${name} ${oid}`;
+  return out;
+}
+
+function cachedFetchAnswer(repo: Repo, body: Buffer, compute: () => GitResponse): GitResponse {
+  const key = `${createHash('sha1').update(body).digest('hex')}|${repoStateFingerprint(repo)}`;
+  let cache = fetchAnswerCache.get(repo);
+  if (cache === undefined) {
+    cache = new Map();
+    fetchAnswerCache.set(repo, cache);
+  }
+  const hit = cache.get(key);
+  if (hit !== undefined) return hit;
+  const answer = compute();
+  if (answer.status === 200) {
+    cache.set(key, answer);
+    while (cache.size > FETCH_ANSWER_CACHE_MAX) cache.delete(cache.keys().next().value as string);
+  }
+  return answer;
+}
+
+// ---------------------------------------------------------------------------------------------
 // upload-pack / receive-pack POSTs
 
 export function handleUploadPack(repo: Repo, body: Buffer): GitResponse {
@@ -622,12 +663,16 @@ export function handleUploadPack(repo: Repo, body: Buffer): GitResponse {
   }
   if (first === 'command=fetch') {
     const args = parseFetchArgs(lines);
-    const plan = planFetch(repo, args);
-    return { status: 200, contentType: 'application/x-git-upload-pack-result', body: v2FetchResponse(repo, plan, args.done) };
+    return cachedFetchAnswer(repo, body, () => {
+      const plan = planFetch(repo, args);
+      return { status: 200, contentType: 'application/x-git-upload-pack-result', body: v2FetchResponse(repo, plan, args.done) };
+    });
   }
   if (first.startsWith('want ')) {
-    const plan = planFetch(repo, parseFetchArgs(lines));
-    return { status: 200, contentType: 'application/x-git-upload-pack-result', body: v0FetchResponse(repo, plan) };
+    return cachedFetchAnswer(repo, body, () => {
+      const plan = planFetch(repo, parseFetchArgs(lines));
+      return { status: 200, contentType: 'application/x-git-upload-pack-result', body: v0FetchResponse(repo, plan) };
+    });
   }
   return { status: 400, contentType: 'text/plain', body: Buffer.from('unsupported upload-pack request\n') };
 }

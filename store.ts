@@ -157,7 +157,20 @@ export interface TreeEntry {
   oid: string;
 }
 
+/**
+ * Parse caches keyed by the object data buffer itself. A stored object's data is
+ * never mutated or replaced (the same invariant the zlib-stream cache in git.ts
+ * relies on), and no caller mutates a returned view or entry list, so a parse is a
+ * pure function of the buffer and can be reused for the buffer's whole life. The
+ * WeakMap lets buffers the store has dropped (a deleted repository's objects) be
+ * collected with their parses.
+ */
+const treeParseCache = new WeakMap<Buffer, TreeEntry[]>();
+const commitParseCache = new WeakMap<Buffer, CommitView>();
+
 export function parseTree(data: Buffer): TreeEntry[] {
+  const cached = treeParseCache.get(data);
+  if (cached !== undefined) return cached;
   const entries: TreeEntry[] = [];
   let offset = 0;
   while (offset < data.length) {
@@ -170,6 +183,7 @@ export function parseTree(data: Buffer): TreeEntry[] {
     });
     offset = nul + 21;
   }
+  treeParseCache.set(data, entries);
   return entries;
 }
 
@@ -199,6 +213,8 @@ export interface CommitView {
 }
 
 export function parseCommit(data: Buffer): CommitView {
+  const cached = commitParseCache.get(data);
+  if (cached !== undefined) return cached;
   const blank = data.indexOf('\n\n');
   const headerEnd = blank < 0 ? data.length : blank;
   const lines = data.subarray(0, headerEnd).toString('utf8').split('\n');
@@ -212,7 +228,9 @@ export function parseCommit(data: Buffer): CommitView {
     else if (line.startsWith('author ')) author = line.slice(7);
     else if (line.startsWith('committer ')) committer = line.slice(10);
   }
-  return { tree, parents, author, committer, message: blank < 0 ? '' : data.subarray(blank + 2).toString('utf8') };
+  const view: CommitView = { tree, parents, author, committer, message: blank < 0 ? '' : data.subarray(blank + 2).toString('utf8') };
+  commitParseCache.set(data, view);
+  return view;
 }
 
 export function parseTagTarget(data: Buffer): { object: string; type: string } {
@@ -316,9 +334,29 @@ export function commitAncestors(repo: Repo, tip: string): Set<string> {
   return seen;
 }
 
-/** True when `ancestor` is `descendant` itself or one of its ancestors. */
+/**
+ * True when `ancestor` is `descendant` itself or one of its ancestors. The walk
+ * stops the moment the ancestor is met: building the descendant's whole ancestry
+ * set first (what this used to do) made every fast-forward check on a branch cost
+ * a full history walk, so a chain of N pushes paid N history walks — quadratic in
+ * the chain length. The answer is the same either way; only the early exit differs.
+ */
 export function isAncestor(repo: Repo, ancestor: string, descendant: string): boolean {
-  return commitAncestors(repo, descendant).has(ancestor);
+  if (ancestor === descendant) return true;
+  const seen = new Set<string>();
+  const stack = [descendant];
+  while (stack.length) {
+    const oid = stack.pop() as string;
+    if (seen.has(oid)) continue;
+    seen.add(oid);
+    const commit = getCommit(repo, oid);
+    if (!commit) continue;
+    for (const parent of commit.parents) {
+      if (parent === ancestor) return true;
+      stack.push(parent);
+    }
+  }
+  return false;
 }
 
 /** The best common ancestor of two commits (least total distance), or null. */

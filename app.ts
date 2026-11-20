@@ -82,6 +82,27 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     return;
   }
 
+  // The REST branch is checked before the git route pattern: the two path
+  // shapes are disjoint (a git path is /<owner>/<repo>.git/<endpoint>, never
+  // /api/v3/...), and REST traffic should not pay a regex exec per request.
+  if (path === '/api/v3' || path.startsWith('/api/v3/')) {
+    // A GET or HEAD that declares no body has none to read: consuming its stream
+    // anyway costs an async-iterator round trip per request and changes nothing —
+    // the handlers only ever parse a body on methods that carry one, and a GET
+    // that does declare a body is still read in full below.
+    const declaresBody =
+      req.headers['transfer-encoding'] !== undefined ||
+      (req.headers['content-length'] !== undefined && req.headers['content-length'] !== '0');
+    const body =
+      (method === 'GET' || method === 'HEAD') && !declaresBody
+        ? Buffer.alloc(0)
+        : method === 'GET' || method === 'DELETE'
+          ? await readBody(req).catch(() => Buffer.alloc(0))
+          : await readBody(req);
+    await handleRest(req, res, url, body);
+    return;
+  }
+
   const gitMatch = GIT_ROUTE.exec(path);
   if (gitMatch) {
     if (!authorized(req)) {
@@ -132,12 +153,6 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (path === '/mcp') {
     const body = method === 'POST' ? await readBody(req) : Buffer.alloc(0);
     await handleMcp(req, res, body);
-    return;
-  }
-
-  if (path === '/api/v3' || path.startsWith('/api/v3/')) {
-    const body = method === 'GET' || method === 'DELETE' ? await readBody(req).catch(() => Buffer.alloc(0)) : await readBody(req);
-    await handleRest(req, res, url, body);
     return;
   }
 
