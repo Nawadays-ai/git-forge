@@ -43,6 +43,14 @@ export interface Issue {
   labels: string[];
   comments: Comment[];
   seq: number;
+  /**
+   * Serialization bookkeeping for rest.ts's issue cache: `jsonVersion` is bumped by
+   * every handler that mutates the issue (an edit, a state change, a label change,
+   * a comment added), and `jsonCache` holds the REST representation serialized at
+   * that version. A cached body is served only while the two agree.
+   */
+  jsonVersion: number;
+  jsonCache?: { version: number; text: string };
 }
 
 export interface Pull {
@@ -74,6 +82,14 @@ export interface Repo {
   /** Issues and pull requests share one number sequence, as on GitHub. */
   nextNumber: number;
   seq: number;
+  /**
+   * A monotone counter bumped on every change a git-surface answer can observe:
+   * an object inserted, a ref set or deleted. (The default branch never changes
+   * after creation, and issues/pulls/labels are invisible to the git surface.)
+   * git.ts keys its per-repository answer caches by it: a cached advertisement,
+   * ls-refs or fetch answer is served only while the version stands.
+   */
+  version: number;
 }
 
 /** All repositories, keyed by name; every repository belongs to the token's owner. */
@@ -112,6 +128,7 @@ export function createRepo(name: string, description: string, isPrivate: boolean
     pulls: new Map(),
     nextNumber: 1,
     seq: nextSeq(),
+    version: 0,
   };
   repos.set(name, repo);
   return repo;
@@ -145,10 +162,33 @@ export function hashObject(type: GitObjectType, data: Buffer): string {
   return hash.digest('hex');
 }
 
+/**
+ * Insert an object the store does not hold yet (objects are content-addressed and
+ * immutable, so an oid already present is never replaced) and bump the repo
+ * version the git-surface caches key on. Returns whether the object was new.
+ */
+export function insertObject(repo: Repo, oid: string, object: GitObject): boolean {
+  if (repo.objects.has(oid)) return false;
+  repo.objects.set(oid, object);
+  repo.version += 1;
+  return true;
+}
+
 export function storeObject(repo: Repo, type: GitObjectType, data: Buffer): string {
   const oid = hashObject(type, data);
-  if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
+  insertObject(repo, oid, { type, data });
   return oid;
+}
+
+/** Set a ref and bump the repo version (a git-surface answer may observe it). */
+export function setRef(repo: Repo, ref: string, oid: string): void {
+  repo.refs.set(ref, oid);
+  repo.version += 1;
+}
+
+/** Delete a ref, bumping the repo version when the ref existed. */
+export function deleteRef(repo: Repo, ref: string): void {
+  if (repo.refs.delete(ref)) repo.version += 1;
 }
 
 export interface TreeEntry {
@@ -183,6 +223,13 @@ export function parseTree(data: Buffer): TreeEntry[] {
     });
     offset = nul + 21;
   }
+  // The cached result is shared by every reader for the buffer's whole life, so
+  // it is frozen before it is stored: the audit of every call site (object
+  // walks, tree flattening, contents lookups, listings) found readers only, and
+  // the freeze turns any future in-place mutation of a shared parse into a loud
+  // TypeError at the mutation site instead of a silent corruption of the cache.
+  for (const entry of entries) Object.freeze(entry);
+  Object.freeze(entries);
   treeParseCache.set(data, entries);
   return entries;
 }
@@ -229,6 +276,10 @@ export function parseCommit(data: Buffer): CommitView {
     else if (line.startsWith('committer ')) committer = line.slice(10);
   }
   const view: CommitView = { tree, parents, author, committer, message: blank < 0 ? '' : data.subarray(blank + 2).toString('utf8') };
+  // Frozen for the same reason parseTree's result is (see there): the view and
+  // its parent list are shared by every walk that touches this commit.
+  Object.freeze(view.parents);
+  Object.freeze(view);
   commitParseCache.set(data, view);
   return view;
 }
@@ -339,9 +390,20 @@ export function commitAncestors(repo: Repo, tip: string): Set<string> {
  * stops the moment the ancestor is met: building the descendant's whole ancestry
  * set first (what this used to do) made every fast-forward check on a branch cost
  * a full history walk, so a chain of N pushes paid N history walks — quadratic in
- * the chain length. The answer is the same either way; only the early exit differs.
+ * the chain length.
+ *
+ * The two validations up front keep the early-exit's answers identical to the
+ * old set-membership ones. The ancestry set only ever held commits that exist in
+ * the store (commitAncestors adds an oid only when getCommit succeeds), so a
+ * missing oid, the zero oid, a blob or a tree was never "an ancestor" — not even
+ * of itself — and a parent entry naming an object the store does not hold was
+ * never in the set either. Without the checks, the `ancestor === descendant`
+ * shortcut and meeting a dangling parent mid-walk would both answer true where
+ * the set answered false. Two cached parses keep the fast-forward fast path
+ * (two real commits, met one step in) at O(1) before the walk starts.
  */
 export function isAncestor(repo: Repo, ancestor: string, descendant: string): boolean {
+  if (getCommit(repo, ancestor) === null || getCommit(repo, descendant) === null) return false;
   if (ancestor === descendant) return true;
   const seen = new Set<string>();
   const stack = [descendant];

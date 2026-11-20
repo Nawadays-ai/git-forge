@@ -12,6 +12,7 @@
 //   5. Close the server and exit 0.
 
 import { createApp } from './app.ts';
+import { warmUp } from './git.ts';
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 if (ENV_URL === '') {
@@ -74,6 +75,8 @@ async function waitForDone(): Promise<void> {
 
 /** Bound the port, register it, then wait for the env: the whole life of the process. */
 async function main(): Promise<void> {
+  // Tier the hot helpers up on synthetic data before the first request lands.
+  warmUp();
   const server = createApp();
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);

@@ -28,13 +28,14 @@ import {
   peelToCommit,
   refCommit,
   repos,
+  setRef,
   storeObject,
   ZERO_OID,
   type Issue,
   type Pull,
   type Repo,
 } from './store.ts';
-import { authorized, notFound, sendJson, unauthorized } from './app.ts';
+import { authorized, notFound, sendJson, sendJsonText, unauthorized } from './app.ts';
 
 type Json = Record<string, unknown>;
 
@@ -102,6 +103,29 @@ export function issueObject(repo: Repo, issue: Issue): Json {
     updated_at: isoOfSeq(issue.seq),
     html_url: `http://forge/${repo.owner}/${repo.name}/issues/${issue.number}`,
   };
+}
+
+/**
+ * The issue's REST representation, serialized — cached on the issue itself and
+ * reused while `issue.jsonVersion` stands. Every handler that mutates an issue
+ * bumps that version (the REST edit and comment routes below, and the GraphQL
+ * close and comment mutations), and a label's name, color and description never
+ * change after the label is created, so the serialized form — labels embedded —
+ * is a pure function of the issue at its version. The read workload re-reads one
+ * issue thousands of times; without this it re-serializes the same object, and
+ * re-derives every label object in it, on every request.
+ */
+export function issueJson(repo: Repo, issue: Issue): string {
+  const cached = issue.jsonCache;
+  if (cached !== undefined && cached.version === issue.jsonVersion) return cached.text;
+  const text = JSON.stringify(issueObject(repo, issue));
+  issue.jsonCache = { version: issue.jsonVersion, text };
+  return text;
+}
+
+/** Mark an issue mutated: its cached serialization no longer stands. */
+export function touchIssue(issue: Issue): void {
+  issue.jsonVersion += 1;
 }
 
 function branchTip(repo: Repo, branch: string): string | null {
@@ -223,7 +247,7 @@ function commitFiles(repo: Repo, branch: string, changes: ReadonlyMap<string, Bu
   const tree = buildTreeFromFiles(repo, files);
   const seq = nextSeq();
   const commit = storeObject(repo, 'commit', buildCommitData(tree, tip !== null ? [tip] : [], messageText, seq));
-  repo.refs.set(ref, commit);
+  setRef(repo, ref, commit);
   return commit;
 }
 
@@ -351,7 +375,7 @@ function routeRepo(req: IncomingMessage, res: ServerResponse, url: URL, body: Bu
         message(res, 422, `Reference already exists: ${ref}`);
         return;
       }
-      repo.refs.set(ref, sha);
+      setRef(repo, ref, sha);
       sendJson(res, 201, { ref, node_id: `REF_${ref}`, object: { sha, type: repo.objects.get(sha)?.type ?? 'commit' } });
       return;
     }
@@ -629,6 +653,7 @@ export function createIssue(repo: Repo, title: string, bodyText: string, labels:
     labels: [...labels],
     comments: [],
     seq: nextSeq(),
+    jsonVersion: 0,
   };
   repo.nextNumber += 1;
   repo.issues.set(issue.number, issue);
@@ -657,7 +682,7 @@ function routeIssues(req: IncomingMessage, res: ServerResponse, url: URL, body: 
         message(res, 422, created.error);
         return;
       }
-      sendJson(res, 201, issueObject(repo, created));
+      sendJsonText(res, 201, issueJson(repo, created));
       return;
     }
     if (method === 'GET') {
@@ -666,7 +691,8 @@ function routeIssues(req: IncomingMessage, res: ServerResponse, url: URL, body: 
       let issues = [...repo.issues.values()];
       if (state === 'open' || state === 'closed') issues = issues.filter((issue) => issue.state === state);
       issues.sort((a, b) => (direction === 'asc' ? a.number - b.number : b.number - a.number));
-      sendJson(res, 200, paginate(issues, pageOf(url)).map((issue) => issueObject(repo, issue)));
+      const page = paginate(issues, pageOf(url));
+      sendJsonText(res, 200, `[${page.map((issue) => issueJson(repo, issue)).join(',')}]`);
       return;
     }
   }
@@ -676,12 +702,16 @@ function routeIssues(req: IncomingMessage, res: ServerResponse, url: URL, body: 
 
   if (rest.length === 2 && issue !== undefined) {
     if (method === 'GET') {
-      sendJson(res, 200, issueObject(repo, issue));
+      sendJsonText(res, 200, issueJson(repo, issue));
       return;
     }
     if (method === 'PATCH') {
       const parsed = parseBody(res, body);
       if (parsed === null) return;
+      // Bump before applying anything: the fields below are applied one by one
+      // and a later label check can still refuse the request, so the cached
+      // serialization must fall the moment any field may have moved.
+      touchIssue(issue);
       const state = stringField(parsed, 'state');
       if (state === 'open' || state === 'closed') issue.state = state;
       const title = stringField(parsed, 'title');
@@ -698,7 +728,7 @@ function routeIssues(req: IncomingMessage, res: ServerResponse, url: URL, body: 
         }
         issue.labels = labels;
       }
-      sendJson(res, 200, issueObject(repo, issue));
+      sendJsonText(res, 200, issueJson(repo, issue));
       return;
     }
   }
@@ -714,6 +744,7 @@ function routeIssues(req: IncomingMessage, res: ServerResponse, url: URL, body: 
       }
       const comment = { id: nextCommentId(), body: bodyText, seq: nextSeq() };
       issue.comments.push(comment);
+      touchIssue(issue);
       sendJson(res, 201, commentObject(issue, comment));
       return;
     }
@@ -863,7 +894,7 @@ export function mergePull(repo: Repo, pull: Pull, method: string): { sha: string
   const parents = method === 'merge' ? [baseTip, headTip] : [baseTip];
   const messageText = method === 'merge' ? `Merge pull request #${pull.number} from ${pull.headRef}\n\n${pull.title}` : `${pull.title} (#${pull.number})${pull.body ? `\n\n${pull.body}` : ''}`;
   const commit = storeObject(repo, 'commit', buildCommitData(tree, parents, messageText, seq));
-  repo.refs.set(`refs/heads/${pull.baseRef}`, commit);
+  setRef(repo, `refs/heads/${pull.baseRef}`, commit);
   pull.state = 'closed';
   pull.merged = true;
   pull.mergeCommitSha = commit;

@@ -21,7 +21,7 @@ import {
   type Pull,
   type Repo,
 } from './store.ts';
-import { createIssue, createPull, mergePull, pullFiles, pullMergeable } from './rest.ts';
+import { createIssue, createPull, mergePull, pullFiles, pullMergeable, touchIssue } from './rest.ts';
 import { authorized, sendJson, unauthorized } from './app.ts';
 
 // ---------------------------------------------------------------------------------------------
@@ -622,6 +622,7 @@ function resolveField(typeName: string, source: GqlValue, field: string, args: M
           return null;
         }
         found.issue.state = 'closed';
+        touchIssue(found.issue);
         return tagged('CloseIssuePayload', { issue: issueValue(found.repo, found.issue) });
       }
       case 'createPullRequest': {
@@ -659,6 +660,7 @@ function resolveField(typeName: string, source: GqlValue, field: string, args: M
         }
         const comment = { id: nextCommentId(), body: String(input.body ?? ''), seq: nextSeq() };
         found.issue.comments.push(comment);
+        touchIssue(found.issue);
         return tagged('AddCommentPayload', {
           commentEdge: tagged('IssueCommentEdge', {
             node: tagged('IssueComment', { comment, repo: found.repo, issue: found.issue }),

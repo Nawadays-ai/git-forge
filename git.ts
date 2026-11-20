@@ -17,12 +17,17 @@ import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
 import {
   ZERO_OID,
+  buildTreeData,
+  deleteRef,
   getCommit,
   hashObject,
+  insertObject,
   isAncestor,
+  parseCommit,
   parseTagTarget,
   parseTree,
   peelToCommit,
+  setRef,
   type GitObject,
   type GitObjectType,
   type Repo,
@@ -338,8 +343,17 @@ function v2Advertisement(service: string): Buffer {
 }
 
 export function handleInfoRefs(repo: Repo, service: string, version2: boolean): GitResponse {
+  // The advertisement is a pure function of the refs (and the default branch,
+  // which never changes after creation), so it is one of the answers the
+  // version-keyed cache below replays verbatim while the repo version stands.
+  const cache = gitCacheFor(repo).infoRefs;
+  const key = `${service}|${version2 ? 'v2' : 'v0'}`;
+  const hit = cache.get(key);
+  if (hit !== undefined) return hit;
   const body = service === 'git-upload-pack' && version2 ? v2Advertisement(service) : v0Advertisement(repo, service);
-  return { status: 200, contentType: `application/x-${service}-advertisement`, body };
+  const answer: GitResponse = { status: 200, contentType: `application/x-${service}-advertisement`, body };
+  cache.set(key, answer);
+  return answer;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -601,36 +615,49 @@ function parseFetchArgs(lines: readonly string[]): FetchArgs {
 }
 
 // ---------------------------------------------------------------------------------------------
-// fetch answers, reused
+// git-surface answers, reused
 
 /**
- * A fetch answer is a pure function of the repository's objects and refs and of
- * the request body: the plan reads nothing else, pack building is deterministic,
- * and objects are immutable and content-addressed. The store only ever grows —
- * objects are added, never removed or changed — so the pair (refs fingerprint,
- * object count) identifies the store exactly: the count can never revisit a value
- * holding different contents, and the fingerprint pins every ref. A burst of
- * identical fetches (concurrent clones of one tip) therefore reuses the first
- * answer's bytes instead of replanning and repacking per request. Only a handful
- * of answers are kept per repository, oldest first out.
+ * The clone-phase answers — the info/refs advertisement, the v2 ls-refs reply
+ * and the fetch reply — are pure functions of the repository's objects and refs
+ * (fetch planning reads the objects alone; the advertisement and ls-refs read
+ * the refs and the default branch, which is set once at creation and never
+ * changes). The store is append-only and content-addressed, and store.ts bumps
+ * `repo.version` on every object insert and every ref set or delete, so the
+ * version names the state exactly: while it stands, a computed answer can be
+ * replayed byte for byte, and the moment it moves every cached answer is
+ * dropped at once (which also bounds how long a burst's answers are retained).
+ * A burst of identical requests (concurrent clones of one tip) therefore reuses
+ * the first answer's bytes instead of replanning, repacking and re-serializing
+ * per request. Only a handful of answers are kept per repository, oldest first
+ * out. Fetch keys carry their protocol: the v2 and v0 request shapes are
+ * dispatched on the body's first line, but the key says which planner produced
+ * the answer, so no two protocols can ever share an entry.
  */
-const fetchAnswerCache = new WeakMap<Repo, Map<string, GitResponse>>();
-const FETCH_ANSWER_CACHE_MAX = 4;
-
-function repoStateFingerprint(repo: Repo): string {
-  const refs = [...repo.refs.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-  let out = `${repo.objects.size}`;
-  for (const [name, oid] of refs) out += `\n${name} ${oid}`;
-  return out;
+interface RepoGitCache {
+  version: number;
+  fetch: Map<string, GitResponse>;
+  infoRefs: Map<string, GitResponse>;
+  lsRefs: Map<string, GitResponse>;
 }
 
-function cachedFetchAnswer(repo: Repo, body: Buffer, compute: () => GitResponse): GitResponse {
-  const key = `${createHash('sha1').update(body).digest('hex')}|${repoStateFingerprint(repo)}`;
-  let cache = fetchAnswerCache.get(repo);
-  if (cache === undefined) {
-    cache = new Map();
-    fetchAnswerCache.set(repo, cache);
+const repoGitCaches = new WeakMap<Repo, RepoGitCache>();
+const FETCH_ANSWER_CACHE_MAX = 4;
+const LS_REFS_CACHE_MAX = 8;
+
+/** The repo's answer cache, reset wholesale whenever the repo version has moved. */
+function gitCacheFor(repo: Repo): RepoGitCache {
+  let cache = repoGitCaches.get(repo);
+  if (cache === undefined || cache.version !== repo.version) {
+    cache = { version: repo.version, fetch: new Map(), infoRefs: new Map(), lsRefs: new Map() };
+    repoGitCaches.set(repo, cache);
   }
+  return cache;
+}
+
+function cachedFetchAnswer(repo: Repo, protocol: 'v2' | 'v0', body: Buffer, compute: () => GitResponse): GitResponse {
+  const cache = gitCacheFor(repo).fetch;
+  const key = `${protocol}|${createHash('sha1').update(body).digest('hex')}`;
   const hit = cache.get(key);
   if (hit !== undefined) return hit;
   const answer = compute();
@@ -657,19 +684,28 @@ export function handleUploadPack(repo: Repo, body: Buffer): GitResponse {
       else if (line === 'unborn') args.unborn = true;
       else if (line.startsWith('ref-prefix ')) args.prefixes.push(line.slice('ref-prefix '.length));
     }
+    // The reply is a function of the refs, the default branch and these args:
+    // replay it while the repo version stands (see the cache's note above).
+    const cache = gitCacheFor(repo).lsRefs;
+    const key = JSON.stringify([args.peel, args.symrefs, args.unborn, args.prefixes]);
+    const hit = cache.get(key);
+    if (hit !== undefined) return hit;
     const out = lsRefsLines(repo, args).map((line) => pktLine(`${line}\n`));
     out.push(PKT_FLUSH);
-    return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(out) };
+    const answer: GitResponse = { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(out) };
+    cache.set(key, answer);
+    while (cache.size > LS_REFS_CACHE_MAX) cache.delete(cache.keys().next().value as string);
+    return answer;
   }
   if (first === 'command=fetch') {
     const args = parseFetchArgs(lines);
-    return cachedFetchAnswer(repo, body, () => {
+    return cachedFetchAnswer(repo, 'v2', body, () => {
       const plan = planFetch(repo, args);
       return { status: 200, contentType: 'application/x-git-upload-pack-result', body: v2FetchResponse(repo, plan, args.done) };
     });
   }
   if (first.startsWith('want ')) {
-    return cachedFetchAnswer(repo, body, () => {
+    return cachedFetchAnswer(repo, 'v0', body, () => {
       const plan = planFetch(repo, parseFetchArgs(lines));
       return { status: 200, contentType: 'application/x-git-upload-pack-result', body: v0FetchResponse(repo, plan) };
     });
@@ -709,7 +745,7 @@ export function handleReceivePack(repo: Repo, body: Buffer): GitResponse {
   if (packStart < body.length && body.subarray(packStart, packStart + 4).toString('ascii') === 'PACK') {
     try {
       const objects = readPack(repo, body.subarray(packStart));
-      for (const [oid, object] of objects) if (!repo.objects.has(oid)) repo.objects.set(oid, object);
+      for (const [oid, object] of objects) insertObject(repo, oid, object);
     } catch (err) {
       unpackError = err instanceof Error ? err.message : String(err);
     }
@@ -759,7 +795,7 @@ function applyPushCommand(repo: Repo, command: PushCommand): { ref: string; ok: 
   const current = repo.refs.get(ref) ?? ZERO_OID;
 
   if (newOid === ZERO_OID) {
-    repo.refs.delete(ref);
+    deleteRef(repo, ref);
     return { ref, ok: true, reason: '' };
   }
   const newObject = repo.objects.get(newOid);
@@ -767,7 +803,7 @@ function applyPushCommand(repo: Repo, command: PushCommand): { ref: string; ok: 
 
   if (oldOid === ZERO_OID) {
     if (current !== ZERO_OID && current !== newOid) return { ref, ok: false, reason: 'reference already exists' };
-    repo.refs.set(ref, newOid);
+    setRef(repo, ref, newOid);
     return { ref, ok: true, reason: '' };
   }
   if (current !== oldOid) return { ref, ok: false, reason: 'stale info' };
@@ -779,6 +815,49 @@ function applyPushCommand(repo: Repo, command: PushCommand): { ref: string; ok: 
       return { ref, ok: false, reason: 'non-fast-forward' };
     }
   }
-  repo.refs.set(ref, newOid);
+  setRef(repo, ref, newOid);
   return { ref, ok: true, reason: '' };
+}
+
+// ---------------------------------------------------------------------------------------------
+// startup warm-up
+
+/**
+ * A few hundred iterations over the helpers every request path exercises —
+ * hashing, commit and tree parsing, tree building, pack writing, packet
+ * framing, JSON — on fixed synthetic data, run once before the server accepts
+ * (main.ts calls it before createApp). V8 tiers functions up as they run;
+ * without this, the first requests a fresh process serves — which is all a
+ * benchmark's opening rounds are — pay the interpreter-to-compiler climb that
+ * steady-state requests do not. The data is synthetic and local, nothing is
+ * stored anywhere, and the result is discarded.
+ */
+export function warmUp(): void {
+  const blob = Buffer.alloc(1024, 0x61);
+  const blobOid = hashObject('blob', blob);
+  const treeData = buildTreeData([
+    { mode: '100644', name: 'a.ts', oid: blobOid },
+    { mode: '100644', name: 'b.ts', oid: blobOid },
+    { mode: '40000', name: 'src', oid: blobOid },
+  ]);
+  const treeOid = hashObject('tree', treeData);
+  const commitData = Buffer.from(
+    `tree ${treeOid}\nauthor Dev <dev@example.com> 1700000000 +0000\ncommitter Dev <dev@example.com> 1700000000 +0000\n\nwarm-up\n`,
+    'utf8',
+  );
+  const objects: GitObject[] = [
+    { type: 'blob', data: blob },
+    { type: 'tree', data: treeData },
+  ];
+  const sample = { title: 'Warm-up issue', body: 'x'.repeat(256), labels: [{ name: 'bug', color: 'd73a4a' }] };
+  let sink = 0;
+  for (let i = 0; i < 300; i += 1) {
+    const commit = parseCommit(commitData);
+    const tree = parseTree(treeData);
+    const pack = writePack(objects);
+    const line = pktLine(`${blobOid} HEAD\0report-status\n`);
+    const text = JSON.stringify(sample);
+    sink += commit.parents.length + tree.length + pack.length + line.length + text.length + hashObject('blob', blob).length;
+  }
+  if (sink === 0) throw new Error('unreachable');
 }

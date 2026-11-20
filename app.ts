@@ -41,6 +41,17 @@ export function sendJson(res: ServerResponse, status: number, body: unknown, hea
   res.end(text);
 }
 
+/** sendJson for a body that is already serialized (rest.ts's cached issue bodies). */
+export function sendJsonText(res: ServerResponse, status: number, text: string, headers: Readonly<Record<string, string>> = {}): void {
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'content-length': Buffer.byteLength(text),
+    'x-github-request-id': requestId(),
+    ...headers,
+  });
+  res.end(text);
+}
+
 export function sendBuffer(res: ServerResponse, status: number, contentType: string, body: Buffer): void {
   res.writeHead(status, {
     'content-type': contentType,
@@ -58,16 +69,41 @@ export function unauthorized(res: ServerResponse): void {
   sendJson(res, 401, { message: 'Bad credentials' });
 }
 
-async function readBody(req: IncomingMessage): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  let total = 0;
-  for await (const chunk of req) {
-    const buffer = chunk as Buffer;
-    total += buffer.length;
-    if (total > 128 * 1024 * 1024) throw new Error('request body too large');
-    chunks.push(buffer);
-  }
-  return Buffer.concat(chunks);
+function readBody(req: IncomingMessage): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    let settled = false;
+    const fail = (error: Error): void => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+    req.on('data', (chunk: Buffer) => {
+      if (settled) return;
+      total += chunk.length;
+      if (total > 128 * 1024 * 1024) {
+        fail(new Error('request body too large'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (settled) return;
+      settled = true;
+      // The common case — the whole body arrived as one chunk — returns that
+      // chunk as it stands: no concatenation pass, and no async-iterator
+      // machinery (a promise, a generator step and a wrapper per chunk) on any
+      // body-bearing request. The size ceiling and the failure behaviour (the
+      // promise rejects, and the caller answers 400) are what the
+      // async-iterator reader had.
+      resolve(chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, total));
+    });
+    req.on('error', fail);
+    req.on('aborted', () => fail(new Error('request aborted')));
+    req.on('close', () => fail(new Error('request closed')));
+  });
 }
 
 const GIT_ROUTE = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/;
